@@ -13,6 +13,11 @@ def get_attack_id(x: Tuple[fbn.Attack, bool, bool]) -> str:
     return repr(x[0])
 
 
+"""
+    
+"""
+
+
 # attack, attack_uses_grad, requires_real_model
 attacks: List[Tuple[fbn.Attack, bool, bool]] = [
     (fa.DDNAttack(), True, False),
@@ -67,8 +72,9 @@ def test_untargeted_attacks(
 
 
 targeted_attacks: List[Tuple[fbn.Attack, bool, bool]] = [
-    (fa.L2CarliniWagnerAttack(binary_search_steps=3, steps=20), True, False),
-    (fa.DDNAttack(), True, False),
+    (fa.SaliencyAttack(), True, False),
+    #(fa.L2CarliniWagnerAttack(binary_search_steps=3, steps=20), True, False),
+    #(fa.DDNAttack(), True, False),
     # TODO: targeted EADAttack currently fails repeatedly on MobileNetv2
     # (
     #     fa.EADAttack(

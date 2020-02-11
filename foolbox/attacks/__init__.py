@@ -34,6 +34,7 @@ from .ead import EADAttack  # noqa: F401
 from .blur import GaussianBlurAttack  # noqa: F401
 from .deepfool import L2DeepFoolAttack, LinfDeepFoolAttack  # noqa: F401
 from .blended_noise import LinearSearchBlendedUniformNoiseAttack  # noqa: F401
+from .saliency import SaliencyAttack  # noqa: F401
 
 # from .blended_noise import LinearSearchBlendedUniformNoiseAttack  # noqa: F401
 # from .brendel_bethge import (  # noqa: F401
