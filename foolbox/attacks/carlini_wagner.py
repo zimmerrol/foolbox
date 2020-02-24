@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Union, Tuple, Any, Optional
 from functools import partial
 import numpy as np
 import eagerpy as ep
@@ -10,22 +10,38 @@ from ..types import Bounds
 
 from ..models import Model
 
+from ..distances import l2
+
 from ..criteria import Misclassification
 from ..criteria import TargetedMisclassification
 
 from .base import MinimizationAttack
 from .base import T
 from .base import get_criterion
+from .base import raise_if_kwargs
 
 
 class L2CarliniWagnerAttack(MinimizationAttack):
-    """Carlini Wagner L2 Attack
+    """Implementation of the Carlini & Wagner L2 Attack. [#Carl16]_
 
-    Parameters
-    ----------
-    steps
-        Number of optimization steps within each binary search step
+    Args:
+        binary_search_steps : Number of steps to perform in the binary search
+            over the const c.
+        steps : Number of optimization steps within each binary search step.
+        stepsize : Stepsize to update the examples.
+        confidence : Confidence required for an example to be marked as adversarial.
+            Controls the gap between example and decision boundary.
+        initial_const : Initial value of the const c with which the binary search starts.
+        abort_early : Stop inner search as soons as an adversarial example has been found.
+            Does not affect the binary search over the const c.
+
+    References:
+        .. [#Carl16] Nicholas Carlini, David Wagner, "Towards evaluating the robustness of
+            neural networks. In 2017 ieee symposium on security and privacy"
+            https://arxiv.org/abs/1608.04644
     """
+
+    distance = l2
 
     def __init__(
         self,
@@ -43,16 +59,19 @@ class L2CarliniWagnerAttack(MinimizationAttack):
         self.initial_const = initial_const
         self.abort_early = abort_early
 
-    def __call__(
+    def run(
         self,
         model: Model,
         inputs: T,
         criterion: Union[Misclassification, TargetedMisclassification, T],
+        *,
+        early_stop: Optional[float] = None,
+        **kwargs: Any,
     ) -> T:
-
+        raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
-        del inputs, criterion
+        del inputs, criterion, kwargs
 
         N = len(x)
 
@@ -155,7 +174,7 @@ class L2CarliniWagnerAttack(MinimizationAttack):
                 found_advs_iter = is_adversarial(perturbed, logits)
                 found_advs = np.logical_or(found_advs, found_advs_iter.numpy())
 
-                norms = flatten(perturbed - x).square().sum(axis=-1).sqrt()
+                norms = flatten(perturbed - x).norms.l2(axis=-1)
                 closer = norms < best_advs_norms
                 new_best = ep.logical_and(closer, found_advs_iter)
 
@@ -176,7 +195,7 @@ class L2CarliniWagnerAttack(MinimizationAttack):
 
 
 class AdamOptimizer:
-    def __init__(self, x: ep.Tensor) -> None:
+    def __init__(self, x: ep.Tensor):
         self.m = ep.zeros_like(x)
         self.v = ep.zeros_like(x)
         self.t = 0

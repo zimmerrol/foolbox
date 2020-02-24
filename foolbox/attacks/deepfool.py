@@ -1,4 +1,5 @@
-from typing import Union, Optional, Tuple
+from typing import Union, Optional, Tuple, Any, Callable
+from typing_extensions import Literal
 import eagerpy as ep
 import logging
 from abc import ABC
@@ -11,65 +12,52 @@ from ..models import Model
 
 from ..criteria import Criterion
 
+from ..distances import l2, linf
+
 from .base import MinimizationAttack
 from .base import T
 from .base import get_criterion
+from .base import raise_if_kwargs
 
 
 class DeepFoolAttack(MinimizationAttack, ABC):
     """A simple and fast gradient-based adversarial attack.
 
-    Implementes DeepFool introduced in [1]_.
+    Implements the `DeepFool`_ attack.
 
     Args:
-        p: Lp-norm that should be minimzed, must be 2 or np.inf.
-        candidates: Limit on the number of the most likely classes that should
+        steps : Maximum number of steps to perform.
+        candidates : Limit on the number of the most likely classes that should
             be considered. A small value is usually sufficient and much faster.
-        overshoot
-        steps: Maximum number of steps to perform.
+        overshoot : How much to overshoot the boundary.
+        loss  Loss function to use inside the update function.
 
-    References
-    ----------
-    .. [1] Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Pascal Frossard,
-           "DeepFool: a simple and accurate method to fool deep neural
-           networks", https://arxiv.org/abs/1511.04599
+
+    .. _DeepFool:
+            Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Pascal Frossard,
+            "DeepFool: a simple and accurate method to fool deep neural
+            networks", https://arxiv.org/abs/1511.04599
 
     """
 
     def __init__(
         self,
+        *,
         steps: int = 50,
         candidates: Optional[int] = 10,
         overshoot: float = 0.02,
-        loss: str = "logits",
+        loss: Union[Literal["logits"], Literal["crossentropy"]] = "logits",
     ):
         self.steps = steps
         self.candidates = candidates
         self.overshoot = overshoot
         self.loss = loss
 
-    def __call__(self, model: Model, inputs: T, criterion: Union[Criterion, T],) -> T:
-        x, restore_type = ep.astensor_(inputs)
-        del inputs
+    def _get_loss_fn(
+        self, model: Model, classes: ep.Tensor,
+    ) -> Callable[[ep.Tensor, int], Tuple[ep.Tensor, Tuple[ep.Tensor, ep.Tensor]]]:
 
-        criterion = get_criterion(criterion)
-
-        min_, max_ = model.bounds
-
-        logits = model(x)
-        classes = logits.argsort(axis=-1).flip(axis=-1)
-        if self.candidates is None:
-            candidates = logits.shape[-1]
-        else:
-            candidates = min(self.candidates, logits.shape[-1])
-            if not candidates >= 2:
-                raise ValueError(
-                    f"expected the model output to have atleast 2 classes, got {logits.shape[-1]}"
-                )
-            logging.info(f"Only testing the top-{candidates} classes")
-            classes = classes[:, :candidates]
-
-        N = len(x)
+        N = len(classes)
         rows = range(N)
         i0 = classes[:, 0]
 
@@ -102,6 +90,42 @@ class DeepFoolAttack(MinimizationAttack, ABC):
                 f"expected loss to be 'logits' or 'crossentropy', got '{self.loss}'"
             )
 
+        return loss_fun
+
+    def run(
+        self,
+        model: Model,
+        inputs: T,
+        criterion: Union[Criterion, T],
+        *,
+        early_stop: Optional[float] = None,
+        **kwargs: Any,
+    ) -> T:
+        raise_if_kwargs(kwargs)
+        x, restore_type = ep.astensor_(inputs)
+        del inputs, kwargs
+
+        criterion = get_criterion(criterion)
+
+        min_, max_ = model.bounds
+
+        logits = model(x)
+        classes = logits.argsort(axis=-1).flip(axis=-1)
+        if self.candidates is None:
+            candidates = logits.shape[-1]  # pragma: no cover
+        else:
+            candidates = min(self.candidates, logits.shape[-1])
+            if not candidates >= 2:
+                raise ValueError(  # pragma: no cover
+                    f"expected the model output to have atleast 2 classes, got {logits.shape[-1]}"
+                )
+            logging.info(f"Only testing the top-{candidates} classes")
+            classes = classes[:, :candidates]
+
+        N = len(x)
+        rows = range(N)
+
+        loss_fun = self._get_loss_fn(model, classes)
         loss_aux_and_grad = ep.value_and_grad_fn(x, loss_fun, has_aux=True)
 
         x0 = x
@@ -164,6 +188,26 @@ class DeepFoolAttack(MinimizationAttack, ABC):
 
 
 class L2DeepFoolAttack(DeepFoolAttack):
+    """A simple and fast gradient-based adversarial attack.
+
+    Implements the DeepFool L2 attack. [#Moos15]_
+
+    Args:
+        steps : Maximum number of steps to perform.
+        candidates : Limit on the number of the most likely classes that should
+            be considered. A small value is usually sufficient and much faster.
+        overshoot : How much to overshoot the boundary.
+        loss  Loss function to use inside the update function.
+
+    References:
+        .. [#Moos15]: Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Pascal Frossard,
+            "DeepFool: a simple and accurate method to fool deep neural
+            networks", https://arxiv.org/abs/1511.04599
+
+    """
+
+    distance = l2
+
     def get_distances(self, losses: ep.Tensor, grads: ep.Tensor) -> ep.Tensor:
         return abs(losses) / (flatten(grads, keep=2).norms.l2(axis=-1) + 1e-8)
 
@@ -177,6 +221,27 @@ class L2DeepFoolAttack(DeepFoolAttack):
 
 
 class LinfDeepFoolAttack(DeepFoolAttack):
+    """A simple and fast gradient-based adversarial attack.
+
+        Implements the `DeepFool`_ L-Infinity attack.
+
+        Args:
+            steps : Maximum number of steps to perform.
+            candidates : Limit on the number of the most likely classes that should
+                be considered. A small value is usually sufficient and much faster.
+            overshoot : How much to overshoot the boundary.
+            loss  Loss function to use inside the update function.
+
+
+        .. _DeepFool:
+                Seyed-Mohsen Moosavi-Dezfooli, Alhussein Fawzi, Pascal Frossard,
+                "DeepFool: a simple and accurate method to fool deep neural
+                networks", https://arxiv.org/abs/1511.04599
+
+        """
+
+    distance = linf
+
     def get_distances(self, losses: ep.Tensor, grads: ep.Tensor) -> ep.Tensor:
         return abs(losses) / (flatten(grads, keep=2).abs().sum(axis=-1) + 1e-8)
 

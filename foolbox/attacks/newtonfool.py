@@ -1,38 +1,52 @@
-from typing import Union, Tuple
+from typing import Union, Tuple, Any, Optional
 import eagerpy as ep
 
 from ..models import Model
 
 from ..criteria import Misclassification
 
+from ..distances import l2
+
 from ..devutils import atleast_kd, flatten
 
 from .base import MinimizationAttack
 from .base import get_criterion
 from .base import T
+from .base import raise_if_kwargs
 
 
 class NewtonFoolAttack(MinimizationAttack):
-    """NewtonFool Attack introduced in [1]_
+    """Implementation of the NewtonFool Attack. [#Jang17]_
 
-    References
-    ----------
-    .. [1] Uyeong Jang et al., "Objective Metrics and Gradient Descent
-           Algorithms for Adversarial Examples in Machine Learning",
-           https://dl.acm.org/citation.cfm?id=3134635
+    Args:
+        steps : Number of update steps to perform.
+        step_size : Size of each update step.
+
+    References:
+        .. [#Jang17] Uyeong Jang et al., "Objective Metrics and Gradient Descent
+            Algorithms for Adversarial Examples in Machine Learning",
+            https://dl.acm.org/citation.cfm?id=3134635
     """
+
+    distance = l2
 
     def __init__(self, steps: int = 100, stepsize: float = 0.01):
         self.steps = steps
         self.stepsize = stepsize
 
-    def __call__(
-        self, model: Model, inputs: T, criterion: Union[Misclassification, T]
+    def run(
+        self,
+        model: Model,
+        inputs: T,
+        criterion: Union[Misclassification, T],
+        *,
+        early_stop: Optional[float] = None,
+        **kwargs: Any,
     ) -> T:
-
+        raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
-        del inputs, criterion
+        del inputs, criterion, kwargs
 
         N = len(x)
 

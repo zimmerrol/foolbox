@@ -66,6 +66,7 @@ class Criterion(ABC):
         Args:
             perturbed: Tensor with perturbed inputs ``(batch, ...)``.
             outputs: Tensor with model outputs for the perturbed inputs ``(batch, ...)``.
+
         Returns:
             A boolean tensor indicating which perturbed inputs are adversarial ``(batch,)``.
         """
@@ -112,6 +113,7 @@ class Misclassification(Criterion):
         del perturbed, outputs
 
         classes = outputs_.argmax(axis=-1)
+        assert classes.shape == self.labels.shape
         is_adv = classes != self.labels
         return restore_type(is_adv)
 
@@ -136,5 +138,6 @@ class TargetedMisclassification(Criterion):
         del perturbed, outputs
 
         classes = outputs_.argmax(axis=-1)
+        assert classes.shape == self.target_classes.shape
         is_adv = classes == self.target_classes
         return restore_type(is_adv)

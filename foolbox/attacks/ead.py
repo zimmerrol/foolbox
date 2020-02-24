@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Union, Tuple, Any, Optional
 from typing_extensions import Literal
 
 import math
@@ -9,15 +9,40 @@ from ..models import Model
 
 from ..criteria import Misclassification, TargetedMisclassification
 
+from ..distances import l1
+
 from ..devutils import atleast_kd, flatten
 
 from .base import MinimizationAttack
 from .base import get_criterion
 from .base import T
+from .base import raise_if_kwargs
 
 
 class EADAttack(MinimizationAttack):
-    """EAD Attack with EN Decision Rule"""
+    """Implementation of the EAD Attack with EN Decision Rule. [#Chen18]_
+
+    Args:
+        binary_search_steps : Number of steps to perform in the binary search
+            over the const c.
+        steps : Number of optimization steps within each binary search step.
+        initial_stepsize : Initial stepsize to update the examples.
+        confidence : Confidence required for an example to be marked as adversarial.
+            Controls the gap between example and decision boundary.
+        initial_const : Initial value of the const c with which the binary search starts.
+        regularization : Controls the L1 regularization.
+        decision_rule : Rule according to which the best adversarial examples are selected.
+            They either minimize the L1 or ElasticNet distance.
+        abort_early : Stop inner search as soons as an adversarial example has been found.
+            Does not affect the binary search over the const c.
+
+    References:
+        .. [#Chen18] Pin-Yu Chen, Yash Sharma, Huan Zhang, Jinfeng Yi, Cho-Jui Hsieh,
+        "EAD: Elastic-Net Attacks to Deep Neural Networks via Adversarial Examples",
+        https://www.aaai.org/ocs/index.php/AAAI/AAAI18/paper/viewPaper/16893
+    """
+
+    distance = l1
 
     def __init__(
         self,
@@ -30,7 +55,6 @@ class EADAttack(MinimizationAttack):
         decision_rule: Union[Literal["EN"], Literal["L1"]] = "EN",
         abort_early: bool = True,
     ):
-
         if decision_rule not in ("EN", "L1"):
             raise ValueError("invalid decision rule")
 
@@ -43,15 +67,19 @@ class EADAttack(MinimizationAttack):
         self.abort_early = abort_early
         self.decision_rule = decision_rule
 
-    def __call__(
+    def run(
         self,
         model: Model,
         inputs: T,
         criterion: Union[Misclassification, TargetedMisclassification, T],
+        *,
+        early_stop: Optional[float] = None,
+        **kwargs: Any,
     ) -> T:
+        raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
-        del inputs, criterion
+        del inputs, criterion, kwargs
 
         N = len(x)
 
@@ -87,11 +115,11 @@ class EADAttack(MinimizationAttack):
             logits = model(y_k)
 
             if targeted:
-                c_minimize = best_other_classes(logits, classes)
+                c_minimize = _best_other_classes(logits, classes)
                 c_maximize = classes
             else:
                 c_minimize = classes
-                c_maximize = best_other_classes(logits, classes)
+                c_maximize = _best_other_classes(logits, classes)
 
             is_adv_loss = logits[rows, c_minimize] - logits[rows, c_maximize]
             assert is_adv_loss.shape == (N,)
@@ -138,7 +166,7 @@ class EADAttack(MinimizationAttack):
                 loss, logits, gradient = loss_aux_and_grad(y_k, consts)
 
                 x_k_old = x_k
-                x_k = project_shrinkage_thresholding(
+                x_k = _project_shrinkage_thresholding(
                     y_k - stepsize * gradient, x, self.regularization, min_, max_
                 )
                 y_k = x_k + iteration / (iteration + 3.0) * (x_k - x_k_old)
@@ -151,7 +179,7 @@ class EADAttack(MinimizationAttack):
 
                 found_advs_iter = is_adversarial(x_k, logits)
 
-                best_advs, best_advs_norms = apply_decision_rule(
+                best_advs, best_advs_norms = _apply_decision_rule(
                     self.decision_rule,
                     self.regularization,
                     best_advs,
@@ -175,28 +203,12 @@ class EADAttack(MinimizationAttack):
         return restore_type(best_advs)
 
 
-def untargeted_is_adv(
-    logits: ep.Tensor, labels: ep.Tensor, confidence: float
-) -> ep.Tensor:
-    logits = logits + ep.onehot_like(logits, labels, value=confidence)
-    classes = logits.argmax(axis=-1)
-    return classes != labels
-
-
-def targeted_is_adv(
-    logits: ep.Tensor, target_classes: ep.Tensor, confidence: float
-) -> ep.Tensor:
-    logits = logits - ep.onehot_like(logits, target_classes, value=confidence)
-    classes = logits.argmax(axis=-1)
-    return classes == target_classes
-
-
-def best_other_classes(logits: ep.Tensor, exclude: ep.Tensor) -> ep.Tensor:
+def _best_other_classes(logits: ep.Tensor, exclude: ep.Tensor) -> ep.Tensor:
     other_logits = logits - ep.onehot_like(logits, exclude, value=ep.inf)
     return other_logits.argmax(axis=-1)
 
 
-def apply_decision_rule(
+def _apply_decision_rule(
     decision_rule: Union[Literal["EN"], Literal["L1"]],
     beta: float,
     best_advs: ep.Tensor,
@@ -209,10 +221,9 @@ def apply_decision_rule(
         norms = beta * flatten(x_k - x).abs().sum(axis=-1) + flatten(
             x_k - x
         ).square().sum(axis=-1)
-    elif decision_rule == "L1":
-        norms = flatten(x_k - x).abs().sum(axis=-1)
     else:
-        raise ValueError("invalid decision rule")
+        # decision rule = L1
+        norms = flatten(x_k - x).abs().sum(axis=-1)
 
     new_best = ep.logical_and(norms < best_advs_norms, found_advs)
     new_best_kd = atleast_kd(new_best, best_advs.ndim)
@@ -222,19 +233,16 @@ def apply_decision_rule(
     return best_advs, best_advs_norms
 
 
-def project_shrinkage_thresholding(
+def _project_shrinkage_thresholding(
     z: ep.Tensor, x0: ep.Tensor, regularization: float, min_: float, max_: float
 ) -> ep.Tensor:
     """Performs the element-wise projected shrinkage-thresholding
     operation"""
 
-    upper_mask = (z - x0 > regularization).float32()
-    lower_mask = (z - x0 < -regularization).float32()
+    upper_mask = z - x0 > regularization
+    lower_mask = z - x0 < -regularization
 
-    projection = (
-        (1.0 - upper_mask - lower_mask) * x0
-        + upper_mask * ep.minimum(z - regularization, max_)
-        + lower_mask * ep.maximum(z + regularization, min_)
-    )
+    projection = ep.where(upper_mask, ep.minimum(z - regularization, max_), x0)
+    projection = ep.where(lower_mask, ep.maximum(z + regularization, min_), projection)
 
     return projection

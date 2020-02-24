@@ -1,4 +1,4 @@
-from typing import Optional, Callable, Tuple, Dict, Any
+from typing import Optional, Callable, Tuple, Dict, Any, List
 import functools
 import pytest
 import eagerpy as ep
@@ -9,6 +9,7 @@ import foolbox as fbn
 ModelAndData = Tuple[fbn.Model, ep.Tensor, ep.Tensor]
 
 models: Dict[str, Tuple[Callable[..., ModelAndData], bool]] = {}
+models_for_attacks: List[str] = []
 
 
 def pytest_addoption(parser: Any) -> None:
@@ -19,13 +20,15 @@ def pytest_addoption(parser: Any) -> None:
 @pytest.fixture(scope="session")
 def dummy(request: Any) -> ep.Tensor:
     backend: Optional[str] = request.config.option.backend
-    if backend is None:
+    if backend is None or backend == "none":
         pytest.skip()
         assert False
     return ep.utils.get_dummy(backend)
 
 
-def register(backend: str, *, real: bool) -> Callable[[Callable], Callable]:
+def register(
+    backend: str, *, real: bool, attack: bool = True
+) -> Callable[[Callable], Callable]:
     def decorator(f: Callable[[Any], ModelAndData]) -> Callable[[Any], ModelAndData]:
         @functools.wraps(f)
         def model(request: Any) -> ModelAndData:
@@ -37,6 +40,8 @@ def register(backend: str, *, real: bool) -> Callable[[Callable], Callable]:
         global real_models
 
         models[model.__name__] = (model, real)
+        if attack:
+            models_for_attacks.append(model.__name__)
         return model
 
     return decorator
@@ -75,7 +80,7 @@ def pytorch_simple_model_default_flip(request: Any) -> ModelAndData:
     return pytorch_simple_model(preprocessing=dict(flip_axis=-3))
 
 
-@register("pytorch", real=False)
+@register("pytorch", real=False, attack=False)
 def pytorch_simple_model_default_cpu_native_tensor(request: Any) -> ModelAndData:
     import torch
 
@@ -84,19 +89,19 @@ def pytorch_simple_model_default_cpu_native_tensor(request: Any) -> ModelAndData
     return pytorch_simple_model("cpu", preprocessing=dict(mean=mean, std=std, axis=-3))
 
 
-@register("pytorch", real=False)
+@register("pytorch", real=False, attack=False)
 def pytorch_simple_model_default_cpu_eagerpy_tensor(request: Any) -> ModelAndData:
     mean = 0.05 * ep.torch.arange(3).float32()
     std = ep.torch.ones(3) * 2
     return pytorch_simple_model("cpu", preprocessing=dict(mean=mean, std=std, axis=-3))
 
 
-@register("pytorch", real=False)
+@register("pytorch", real=False, attack=False)
 def pytorch_simple_model_string(request: Any) -> ModelAndData:
     return pytorch_simple_model("cpu")
 
 
-@register("pytorch", real=False)
+@register("pytorch", real=False, attack=False)
 def pytorch_simple_model_object(request: Any) -> ModelAndData:
     import torch
 
@@ -259,44 +264,39 @@ def jax_simple_model(request: Any) -> ModelAndData:
     return fmodel, x, y
 
 
-# def foolbox2_simple_model(channel_axis: int) -> ModelAndData:
-#     class Foolbox2DummyModel(foolbox.models.base.Model):  # type: ignore
-#         def __init__(self) -> None:
-#             super().__init__(
-#                 bounds=(0, 1), channel_axis=channel_axis, preprocessing=(0, 1)
-#             )
-#
-#         def forward(self, inputs: Any) -> Any:
-#             if channel_axis == 1:
-#                 return inputs.mean(axis=(2, 3))
-#             elif channel_axis == 3:
-#                 return inputs.mean(axis=(1, 2))
-#
-#         def num_classes(self) -> int:
-#             return 3
-#
-#     model = Foolbox2DummyModel()
-#     fmodel = fbn.Foolbox2Model(model)
-#
-#     with pytest.warns(UserWarning):
-#         x, _ = fbn.samples(fmodel, dataset="imagenet", batchsize=16)
-#     x = ep.astensor(x)
-#     y = fmodel(x).argmax(axis=-1)
-#     return fmodel, x, y
+@register("numpy", real=False)
+def numpy_simple_model(request: Any) -> ModelAndData:
+    class Model:
+        def __call__(self, inputs: Any) -> Any:
+            return inputs.mean(axis=(2, 3))
 
+    model = Model()
+    with pytest.raises(ValueError):
+        fbn.NumPyModel(model, bounds=(0, 1), data_format="foo")
 
-# @register("numpy")
-# def foolbox2_simple_model_1(request: Any) -> ModelAndData:
-#     return foolbox2_simple_model(1)
+    fmodel = fbn.NumPyModel(model, bounds=(0, 1))
+    with pytest.raises(ValueError, match="data_format"):
+        x, _ = fbn.samples(fmodel, dataset="imagenet", batchsize=16)
 
+    fmodel = fbn.NumPyModel(model, bounds=(0, 1), data_format="channels_first")
+    with pytest.warns(UserWarning, match="returning NumPy arrays"):
+        x, _ = fbn.samples(fmodel, dataset="imagenet", batchsize=16)
 
-# @register("numpy")
-# def foolbox2_simple_model_3(request: Any) -> ModelAndData:
-#     return foolbox2_simple_model(3)
+    x = ep.astensor(x)
+    y = fmodel(x).argmax(axis=-1)
+    return fmodel, x, y
 
 
 @pytest.fixture(scope="session", params=list(models.keys()))
 def fmodel_and_data_ext(request: Any) -> Tuple[ModelAndData, bool]:
+    global models
+    model_fn, real = models[request.param]
+    model_and_data = model_fn(request)
+    return model_and_data, real
+
+
+@pytest.fixture(scope="session", params=models_for_attacks)
+def fmodel_and_data_ext_for_attacks(request: Any) -> Tuple[ModelAndData, bool]:
     global models
     model_fn, real = models[request.param]
     model_and_data = model_fn(request)

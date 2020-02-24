@@ -27,7 +27,7 @@ from .models import Model  # noqa: F401
 from .models import PyTorchModel  # noqa: F401
 from .models import TensorFlowModel  # noqa: F401
 from .models import JAXModel  # noqa: F401
-from .models import Foolbox2Model  # noqa: F401
+from .models import NumPyModel  # noqa: F401
 
 from .utils import accuracy  # noqa: F401
 from .utils import samples  # noqa: F401
@@ -36,3 +36,5 @@ from .attacks import Attack  # noqa: F401
 from . import attacks  # noqa: F401
 
 from . import zoo  # noqa: F401
+
+from . import gradient_estimators  # noqa: F401

@@ -1,42 +1,58 @@
-from typing import Union
+from typing import Union, Any
 import eagerpy as ep
 
 from ..models import Model
 
 from ..criteria import Misclassification
 
+from ..distances import l2
+
 from ..devutils import flatten, atleast_kd
 
 from .base import FixedEpsilonAttack
 from .base import get_criterion
 from .base import T
+from .base import raise_if_kwargs
 
 
 class VirtualAdversarialAttack(FixedEpsilonAttack):
-    """Calculate an untargeted adversarial perturbation by performing a
+    """Second-order gradient-based attack on the logits. [#Miy15]_
+    The attack calculate an untargeted adversarial perturbation by performing a
     approximated second order optimization step on the KL divergence between
     the unperturbed predictions and the predictions for the adversarial
-    perturbation. This attack was introduced in [1]_.
+    perturbation. This attack was originally introduced as the
+    Virtual Adversarial Training [#Miy15]_ method.
 
-    References
-    ----------
-    .. [1] Takeru Miyato, Shin-ichi Maeda, Masanori Koyama, Ken Nakae,
-           Shin Ishii,
-           "Distributional Smoothing with Virtual Adversarial Training",
-           https://arxiv.org/abs/1507.00677
+    Args:
+        steps : Number of update steps.
+        xi : L2 distance between original image and first adversarial proposal.
+
+
+    References:
+        .. [#Miy15] Takeru Miyato, Shin-ichi Maeda, Masanori Koyama, Ken Nakae,
+            Shin Ishii, "Distributional Smoothing with Virtual Adversarial Training",
+            https://arxiv.org/abs/1507.00677
     """
 
-    def __init__(self, xi: float = 1e-6, iterations: int = 1, epsilon: float = 0.3):
-        self.xi = xi
-        self.iterations = iterations
-        self.epsilon = epsilon
+    distance = l2
 
-    def __call__(
-        self, model: Model, inputs: T, criterion: Union[Misclassification, T]
+    def __init__(self, steps: int, xi: float = 1e-6):
+        self.steps = steps
+        self.xi = xi
+
+    def run(
+        self,
+        model: Model,
+        inputs: T,
+        criterion: Union[Misclassification, T],
+        *,
+        epsilon: float,
+        **kwargs: Any,
     ) -> T:
+        raise_if_kwargs(kwargs)
         x, restore_type = ep.astensor_(inputs)
         criterion_ = get_criterion(criterion)
-        del inputs, criterion
+        del inputs, criterion, kwargs
 
         N = len(x)
 
@@ -68,7 +84,7 @@ class VirtualAdversarialAttack(FixedEpsilonAttack):
 
         # start with random vector as search vector
         d = ep.normal(x, shape=x.shape, mean=0, stddev=1)
-        for it in range(self.iterations):
+        for it in range(self.steps):
             # normalize proposal to be unit vector
             d = d * self.xi / atleast_kd(ep.norms.l2(flatten(d), axis=-1), x.ndim)
 
@@ -80,13 +96,10 @@ class VirtualAdversarialAttack(FixedEpsilonAttack):
             d = (bounds[1] - bounds[0]) * d
 
             if ep.any(ep.norms.l2(flatten(d), axis=-1) < 1e-64):
-                raise RuntimeError(
+                raise RuntimeError(  # pragma: no cover
                     "Gradient vanished; this can happen if xi is too small."
                 )
 
-        final_delta = (
-            self.epsilon / ep.sqrt((d ** 2).sum(keepdims=True, axis=(1, 2, 3))) * d
-        )
+        final_delta = epsilon / atleast_kd(ep.norms.l2(flatten(d), axis=-1), d.ndim) * d
         x_adv = ep.clip(x + final_delta, *bounds)
-
         return restore_type(x_adv)

@@ -1,37 +1,38 @@
+from typing import Union, Tuple, Optional, Any
+from typing_extensions import Literal
 import numpy as np
 import eagerpy as ep
-from collections.abc import Callable
 import logging
 
 from ..devutils import flatten
 from ..devutils import atleast_kd
-from . import LinearSearchBlendedUniformNoiseAttack
+
+from ..types import Bounds
+
+from ..models import Model
+
+from ..criteria import Criterion
+
+from ..distances import l2
+
 from ..tensorboard import TensorBoard
-from ..criteria import misclassification
+
+from .blended_noise import LinearSearchBlendedUniformNoiseAttack
+
+from .base import MinimizationAttack
+from .base import T
+from .base import get_criterion
+from .base import get_is_adversarial
+from .base import raise_if_kwargs
 
 
-class BoundaryAttack:
-    def __init__(self, model):
-        self.model = model
+class BoundaryAttack(MinimizationAttack):
+    """A powerful adversarial attack that requires neither gradients
+    nor probabilities.
 
-    def __call__(
-        self,
-        inputs,
-        labels,
-        *,
-        starting_points=None,
-        init_attack=None,
-        criterion: Callable = misclassification,
-        steps=25000,
-        spherical_step=1e-2,
-        source_step=1e-2,
-        source_step_convergance=1e-7,
-        step_adaptation=1.5,
-        tensorboard=False,
-        update_stats_every_k=10,
-    ):
-        """Boundary Attack
+    This is the reference implementation for the attack introduced in [#Bren18]_.
 
+    Notes:
         Differences to the original reference implementation:
         * We do not perform internal operations with float64
         * The samples within a batch can currently influence each other a bit
@@ -39,44 +40,106 @@ class BoundaryAttack:
         * The success rate tracking changed a bit
         * Some other changes due to batching and merged loops
 
-        Parameters
-        ----------
-        criterion : Callable
-            A callable that returns true if the given logits of perturbed
-            inputs should be considered adversarial w.r.t. to the given labels
-            and unperturbed inputs.
-        tensorboard : str
-            The log directory for TensorBoard summaries. If False, TensorBoard
+    Args:
+        init_attack : Attack to use to find a starting points. Defaults to
+            LinearSearchBlendedUniformNoiseAttack. Only used if starting_points is None.
+        steps : Maximum number of steps to run. Might converge and stop before that.
+        spherical_step : Initial step size for the orthogonal (spherical) step.
+        source_step : Initial step size for the step towards the target.
+        source_step_convergance : Sets the threshold of the stop criterion:
+            if source_step becomes smaller than this value during the attack,
+            the attack has converged and will stop.
+        step_adaptation : Factor by which the step sizes are multiplied or divided.
+        tensorboard : The log directory for TensorBoard summaries. If False, TensorBoard
             summaries will be disabled (default). If None, the logdir will be
             runs/CURRENT_DATETIME_HOSTNAME.
-        """
-        tb = TensorBoard(logdir=tensorboard)
+        update_stats_every_k :
 
-        originals = ep.astensor(inputs)
-        labels = ep.astensor(labels)
+    References:
+        .. [#Bren18] Wieland Brendel (*), Jonas Rauber (*), Matthias Bethge,
+           "Decision-Based Adversarial Attacks: Reliable Attacks
+           Against Black-Box Machine Learning Models",
+           https://arxiv.org/abs/1712.04248
+    """
 
-        def is_adversarial(p: ep.Tensor) -> ep.Tensor:
-            """For each input in x, returns true if it is an adversarial for
-            the given model and criterion"""
-            logits = self.model.forward(p)
-            return criterion(originals, labels, p, logits)
+    distance = l2
+
+    def __init__(
+        self,
+        init_attack: Optional[MinimizationAttack] = None,
+        steps: int = 25000,
+        spherical_step: float = 1e-2,
+        source_step: float = 1e-2,
+        source_step_convergance: float = 1e-7,
+        step_adaptation: float = 1.5,
+        tensorboard: Union[Literal[False], None, str] = False,
+        update_stats_every_k: int = 10,
+    ):
+        if init_attack is not None and not isinstance(init_attack, MinimizationAttack):
+            raise NotImplementedError
+        self.init_attack = init_attack
+        self.steps = steps
+        self.spherical_step = spherical_step
+        self.source_step = source_step
+        self.source_step_convergance = source_step_convergance
+        self.step_adaptation = step_adaptation
+        self.tensorboard = tensorboard
+        self.update_stats_every_k = update_stats_every_k
+
+    def run(
+        self,
+        model: Model,
+        inputs: T,
+        criterion: Union[Criterion, T],
+        *,
+        early_stop: Optional[float] = None,
+        starting_points: Optional[T] = None,
+        **kwargs: Any,
+    ) -> T:
+        raise_if_kwargs(kwargs)
+        originals, restore_type = ep.astensor_(inputs)
+        del inputs, kwargs
+
+        criterion = get_criterion(criterion)
+        is_adversarial = get_is_adversarial(criterion, model)
 
         if starting_points is None:
-            if init_attack is None:
-                init_attack = LinearSearchBlendedUniformNoiseAttack
+            init_attack: MinimizationAttack
+            if self.init_attack is None:
+                init_attack = LinearSearchBlendedUniformNoiseAttack(steps=50)
                 logging.info(
                     f"Neither starting_points nor init_attack given. Falling"
-                    f" back to {init_attack.__name__} for initialization."
+                    f" back to {init_attack!r} for initialization."
                 )
-            starting_points = init_attack(self.model)(inputs, labels)
+            else:
+                init_attack = self.init_attack
+            # TODO: use call and support all types of attacks (once early_stop is
+            # possible in __call__)
+            best_advs = init_attack.run(
+                model, originals, criterion, early_stop=early_stop
+            )
+        else:
+            best_advs = ep.astensor(starting_points)
 
-        best_advs = ep.astensor(starting_points)
-        assert is_adversarial(best_advs).all()
+        is_adv = is_adversarial(best_advs)
+        if not is_adv.all():
+            failed = is_adv.logical_not().float32().sum()
+            if starting_points is None:
+                raise ValueError(
+                    f"init_attack failed for {failed} of {len(is_adv)} inputs"
+                )
+            else:
+                raise ValueError(
+                    f"{failed} of {len(is_adv)} starting_points are not adversarial"
+                )
+        del starting_points
+
+        tb = TensorBoard(logdir=self.tensorboard)
 
         N = len(originals)
         ndim = originals.ndim
-        spherical_steps = ep.ones(originals, N) * spherical_step
-        source_steps = ep.ones(originals, N) * source_step
+        spherical_steps = ep.ones(originals, N) * self.spherical_step
+        source_steps = ep.ones(originals, N) * self.source_step
 
         tb.scalar("batchsize", N, 0)
 
@@ -85,12 +148,12 @@ class BoundaryAttack:
         stats_spherical_adversarial = ArrayQueue(maxlen=100, N=N)
         stats_step_adversarial = ArrayQueue(maxlen=30, N=N)
 
-        bounds = self.model.bounds()
+        bounds = model.bounds
 
-        for step in range(1, steps + 1):
-            converged = source_steps < source_step_convergance
+        for step in range(1, self.steps + 1):
+            converged = source_steps < self.source_step_convergance
             if converged.all():
-                break
+                break  # pragma: no cover
             converged = atleast_kd(converged, ndim)
 
             # TODO: performance: ignore those that have converged
@@ -98,13 +161,13 @@ class BoundaryAttack:
             # cannot easily invert this in the end using EagerPy)
 
             unnormalized_source_directions = originals - best_advs
-            source_norms = l2norms(unnormalized_source_directions)
+            source_norms = ep.norms.l2(flatten(unnormalized_source_directions), axis=-1)
             source_directions = unnormalized_source_directions / atleast_kd(
                 source_norms, ndim
             )
 
             # only check spherical candidates every k steps
-            check_spherical_and_update_stats = step % update_stats_every_k == 0
+            check_spherical_and_update_stats = step % self.update_stats_every_k == 0
 
             candidates, spherical_candidates = draw_proposals(
                 bounds,
@@ -121,6 +184,7 @@ class BoundaryAttack:
 
             is_adv = is_adversarial(candidates)
 
+            spherical_is_adv: Optional[ep.Tensor]
             if check_spherical_and_update_stats:
                 spherical_is_adv = is_adversarial(spherical_candidates)
                 stats_spherical_adversarial.append(spherical_is_adv)
@@ -134,7 +198,7 @@ class BoundaryAttack:
 
             # in theory, we are closer per construction
             # but limited numerical precision might break this
-            distances = l2norms(originals - candidates)
+            distances = ep.norms.l2(flatten(originals - candidates), axis=-1)
             closer = distances < source_norms
             is_best_adv = ep.logical_and(is_adv, closer)
             is_best_adv = atleast_kd(is_best_adv, ndim)
@@ -161,17 +225,17 @@ class BoundaryAttack:
                     probs = stats_spherical_adversarial.mean()
                     cond1 = ep.logical_and(probs > 0.5, full)
                     spherical_steps = ep.where(
-                        cond1, spherical_steps * step_adaptation, spherical_steps
+                        cond1, spherical_steps * self.step_adaptation, spherical_steps
                     )
                     source_steps = ep.where(
-                        cond1, source_steps * step_adaptation, source_steps
+                        cond1, source_steps * self.step_adaptation, source_steps
                     )
                     cond2 = ep.logical_and(probs < 0.2, full)
                     spherical_steps = ep.where(
-                        cond2, spherical_steps / step_adaptation, spherical_steps
+                        cond2, spherical_steps / self.step_adaptation, spherical_steps
                     )
                     source_steps = ep.where(
-                        cond2, source_steps / step_adaptation, source_steps
+                        cond2, source_steps / self.step_adaptation, source_steps
                     )
                     stats_spherical_adversarial.clear(ep.logical_or(cond1, cond2))
                     tb.conditional_mean(
@@ -192,11 +256,11 @@ class BoundaryAttack:
                     # instead of p(source_step_success | spherical_step_sucess) that was tracked before
                     cond1 = ep.logical_and(probs > 0.25, full)
                     source_steps = ep.where(
-                        cond1, source_steps * step_adaptation, source_steps
+                        cond1, source_steps * self.step_adaptation, source_steps
                     )
                     cond2 = ep.logical_and(probs < 0.1, full)
                     source_steps = ep.where(
-                        cond2, source_steps / step_adaptation, source_steps
+                        cond2, source_steps / self.step_adaptation, source_steps
                     )
                     stats_step_adversarial.clear(ep.logical_or(cond1, cond2))
                     tb.conditional_mean(
@@ -212,26 +276,26 @@ class BoundaryAttack:
             tb.histogram("spherical_step", spherical_steps, step)
             tb.histogram("source_step", source_steps, step)
         tb.close()
-        return best_advs.tensor
+        return restore_type(best_advs)
 
 
 class ArrayQueue:
-    def __init__(self, maxlen, N):
+    def __init__(self, maxlen: int, N: int):
         # we use NaN as an indicator for missing data
         self.data = np.full((maxlen, N), np.nan)
         self.next = 0
         # used to infer the correct framework because this class uses NumPy
-        self.tensor = None
+        self.tensor: Optional[ep.Tensor] = None
 
     @property
-    def maxlen(self):
-        return self.data.shape[0]
+    def maxlen(self) -> int:
+        return int(self.data.shape[0])
 
     @property
-    def N(self):
-        return self.data.shape[1]
+    def N(self) -> int:
+        return int(self.data.shape[1])
 
-    def append(self, x: ep.Tensor):
+    def append(self, x: ep.Tensor) -> None:
         if self.tensor is None:
             self.tensor = x
         x = x.numpy()
@@ -239,29 +303,27 @@ class ArrayQueue:
         self.data[self.next] = x
         self.next = (self.next + 1) % self.maxlen
 
-    def clear(self, dims: ep.Tensor):
+    def clear(self, dims: ep.Tensor) -> None:
         if self.tensor is None:
-            self.tensor = dims
+            self.tensor = dims  # pragma: no cover
         dims = dims.numpy()
         assert dims.shape == (self.N,)
         assert dims.dtype == np.bool
         self.data[:, dims] = np.nan
 
-    def mean(self):
+    def mean(self) -> ep.Tensor:
+        assert self.tensor is not None
         result = np.nanmean(self.data, axis=0)
         return ep.from_numpy(self.tensor, result)
 
-    def isfull(self):
+    def isfull(self) -> ep.Tensor:
+        assert self.tensor is not None
         result = ~np.isnan(self.data).any(axis=0)
         return ep.from_numpy(self.tensor, result)
 
 
-def l2norms(x):
-    return flatten(x).square().sum(axis=-1).sqrt()
-
-
 def draw_proposals(
-    bounds,
+    bounds: Bounds,
     originals: ep.Tensor,
     perturbed: ep.Tensor,
     unnormalized_source_directions: ep.Tensor,
@@ -269,7 +331,7 @@ def draw_proposals(
     source_norms: ep.Tensor,
     spherical_steps: ep.Tensor,
     source_steps: ep.Tensor,
-):
+) -> Tuple[ep.Tensor, ep.Tensor]:
     # remember the actual shape
     shape = originals.shape
     assert perturbed.shape == shape
@@ -295,7 +357,7 @@ def draw_proposals(
     assert eta.shape == (N, D)
 
     # rescale
-    norms = l2norms(eta)
+    norms = ep.norms.l2(eta, axis=-1)
     assert norms.shape == (N,)
     eta = eta * atleast_kd(spherical_steps * source_norms / norms, eta.ndim)
 
@@ -311,7 +373,7 @@ def draw_proposals(
     # step towards the original inputs
     new_source_directions = originals - spherical_candidates
     assert new_source_directions.ndim == 2
-    new_source_directions_norms = l2norms(new_source_directions)
+    new_source_directions_norms = ep.norms.l2(flatten(new_source_directions), axis=-1)
 
     # length if spherical_candidates would be exactly on the sphere
     lengths = source_steps * source_norms
