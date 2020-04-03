@@ -1,8 +1,7 @@
-from typing import Union, Tuple  # Optional
+from typing import Union, Tuple, Optional
 import eagerpy as ep
 
 from ..devutils import flatten
-from ..devutils import atleast_kd
 
 from ..models import Model
 
@@ -12,6 +11,8 @@ from .base import MinimizationAttack
 from .base import T
 from .base import get_criterion
 from .base import get_is_adversarial
+from ..distances import l0
+from .base import raise_if_kwargs
 
 
 class SaliencyAttack(MinimizationAttack):
@@ -36,9 +37,20 @@ class SaliencyAttack(MinimizationAttack):
         self.stepsize = stepsize
         self.max_perturbations_per_pixel = max_perturbations_per_pixel
 
-    def __call__(
-        self, model: Model, inputs: T, criterion: Union[TargetedMisclassification, T],
+    distance = l0
+
+    def run(
+        self,
+        model: Model,
+        inputs: T,
+        criterion: Union[TargetedMisclassification, T],
+        *,
+        early_stop: Optional[float] = None,
+        **kwargs,
     ) -> T:
+        raise_if_kwargs(kwargs)
+        del kwargs
+
         x, restore_type = ep.astensor_(inputs)
         del inputs
 
@@ -67,6 +79,8 @@ class SaliencyAttack(MinimizationAttack):
             is_adv = is_adversarial(x)
             if is_adv.all() or (mask == 0).all():
                 break  # TODO: modify this if we allow multiple (random) targets
+
+            print(ep.softmax(model(x), -1)[0])
 
             # get pixel location with highest influence on class
             p1_idx, p2_idx, p_sign = self.saliency_map(
@@ -175,22 +189,40 @@ class SaliencyAttack(MinimizationAttack):
         # salmap = ep.abs(alphas) * ep.abs(betas) * ep.sign(alphas * betas)
 
         scores_mask = ep.logical_or(alphas < 0, betas < 0)
-        salmap = (
-            scores_mask.float() * atleast_kd(mask, scores_mask.ndim) * (-alphas * betas)
-        )
+        # salmap = (
+        #    scores_mask.float() * atleast_kd(mask, scores_mask.ndim) * (-alphas * betas)
+        # )
 
-        salmap = salmap.view(N, dim_x * dim_x)
+        reshaped_mask = mask.reshape((N, 1, -1)) * mask.reshape((N, -1, 1))
+
+        print(
+            alphas.shape,
+            betas.shape,
+            reshaped_mask.shape,
+            mask.shape,
+            scores_mask.shape,
+        )
+        salmap = reshaped_mask * (-alphas * betas)
+        salmap = ep.where(scores_mask, salmap, ep.zeros_like(salmap))
+        # mark diagonal with zero values
+        salmap = ep.index_update(
+            salmap, (slice(None), range(salmap.shape[1]), range(salmap.shape[2])), 0
+        )
+        print("salmap", salmap.shape)
+        salmap = salmap.reshape((N, dim_x * dim_x))
         max_idx = ep.argmax(salmap, -1)
         p1 = max_idx % dim_x
         p2 = max_idx // dim_x
 
+        # transform index in flattened tensor back to index in image tensor
         p1 += ep.arange(x, 0, N) * dim_x
         p2 += ep.arange(x, 0, N) * dim_x
-
         p1 = SaliencyAttack.unravel_index(p1, x.shape)
         p2 = SaliencyAttack.unravel_index(p2, x.shape)
 
-        p_sign = ep.sign(alphas)[max_idx]
+        print("max_idx", max_idx.shape)
+
+        p_sign = ep.sign(alphas.reshape((N, -1)))[range(N), max_idx]
 
         # find optimal pixel & direction of perturbation
         # idx = flatten(salmap).argmin(-1) + ep.arange(x, 0, len(x)) * flatten(x).shape[1]
